@@ -1,287 +1,363 @@
 package com.docs_similarity.service;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Locale;
-import java.util.UUID;
-
+import com.docs_similarity.dsa.CommonWordSequenceAnalyzer;
+import com.docs_similarity.extraction.DocumentTextExtractor;
+import com.docs_similarity.extraction.ExtractionException;
+import com.docs_similarity.model.*;
+import com.docs_similarity.util.TokenCombiner;
 import org.springframework.stereotype.Service;
+import org.springframework.web.multipart.MultipartFile;
 
-import com.docs_similarity.config.AppProperties;
-import com.docs_similarity.dsa.CombinedText;
-import com.docs_similarity.dsa.CommonSubstringAnalyzer;
-import com.docs_similarity.dsa.KasaiLCP;
-import com.docs_similarity.dsa.PairRanker;
-import com.docs_similarity.dsa.SimilarityCalculator;
-import com.docs_similarity.dsa.SimilarityCalculator.PairScore;
-import com.docs_similarity.dsa.SuffixArray;
-import com.docs_similarity.dsa.SuffixArrayVerifier;
-import com.docs_similarity.exception.ApiException;
-import com.docs_similarity.model.AlgorithmInfo;
-import com.docs_similarity.model.AnalysisParameters;
-import com.docs_similarity.model.AnalysisResponse;
-import com.docs_similarity.model.AnalysisStage;
-import com.docs_similarity.model.AnalysisSummary;
-import com.docs_similarity.model.CommonSubstring;
-import com.docs_similarity.model.DemoResponse;
-import com.docs_similarity.model.DocumentInput;
-import com.docs_similarity.model.DocumentResult;
-import com.docs_similarity.model.SimilarityResult;
-import com.docs_similarity.model.SuffixArrayPage;
-import com.docs_similarity.model.SuffixArrayRow;
-import com.docs_similarity.util.TextPreprocessor;
-import com.docs_similarity.util.TextPreprocessor.ProcessedText;
+import java.io.IOException;
+import java.util.*;
 
 /**
- * Runs the analysis pipeline:
- * <pre>
- *   documents -&gt; preprocessing -&gt; combined text -&gt; Suffix Array -&gt; Kasai LCP
- *             -&gt; common substrings -&gt; similarity scores -&gt; ranking
- * </pre>
- * Every step is timed and reported back as an {@link AnalysisStage}. The algorithms themselves
- * live in the {@code dsa} package, this class only connects them and builds the response.
+ * DocumentSimilarityService
+ * ------------------------------------------------------------------
+ * Orchestrates the full pipeline:
+ *
+ *   Documents -> Extraction (TXT/PDF/DOCX) -> Normalization -> Word tokenization
+ *   -> Token -> integer ID mapping -> Combined token sequence with unique
+ *   document sentinels -> Suffix Array -> Kasai Algorithm -> LCP Array (in words)
+ *   -> Common word sequences -> Overlap merging -> Similarity Scores -> Ranking
+ *
+ * The extraction step (see com.docs_similarity.extraction) converts
+ * whatever format a document arrives in into plain text. From that point
+ * on, the pipeline is completely format-agnostic.
+ *
+ * SIMILARITY FORMULA
+ * -------------------
+ * For a document pair (A, B), after merging overlapping matches
+ * (CommonSequenceMerger):
+ *
+ *   sharedWordsInA = number of words of A inside at least one merged common
+ *                    word sequence with B (union of intervals, so a word
+ *                    covered by several overlapping matches counts once)
+ *   sharedWordsInB = the same, computed within B
+ *   sharedWords    = min(sharedWordsInA, sharedWordsInB)
+ *
+ *   Similarity(A, B) = (2 x sharedWords / (wordCountA + wordCountB)) x 100
+ *
+ * Raw LCP values are never summed: overlapping suffixes of one passage
+ * ("machine learning algorithms", "learning algorithms", ...) would count
+ * the same words again and again. Taking the smaller of the two sides means
+ * a phrase that occurs once in A and three times in B contributes its words
+ * once, not three times. The result is in [0, 100]: 100% when every word of
+ * both documents is part of a shared sequence (identical documents), 0% when
+ * no common sequence of at least MIN_SEQUENCE_WORDS words exists.
  */
 @Service
 public class DocumentSimilarityService {
 
-    static final String FORMULA =
-            "Similarity(A,B) = (Shared(A,B) + Shared(B,A)) / (|A| + |B|) x 100%";
+    /** Minimum length (in words) for a common word sequence to count. */
+    public static final int MIN_SEQUENCE_WORDS = 3;
 
-    private static final int SA_PREVIEW_SYMBOLS = 48;
-    private static final int MAX_PAGE_SIZE = 200;
-    private static final int MAX_DEMO_LENGTH = 64;
+    /** Maximum number of common word sequences shown per pair in the UI (longest first). */
+    private static final int MAX_SEQUENCES_PER_PAIR = 15;
 
-    private final AppProperties.Analysis settings;
-    private final DocumentValidator validator;
-    private final AnalysisStore store;
+    /** Maximum number of Suffix Array / LCP rows returned for the technical inspection view. */
+    private static final int MAX_SA_SAMPLE_ROWS = 300;
 
-    public DocumentSimilarityService(AppProperties properties, DocumentValidator validator, AnalysisStore store) {
-        this.settings = properties.analysis();
-        this.validator = validator;
-        this.store = store;
+    /** Number of words shown in each suffix preview of the technical view. */
+    private static final int SUFFIX_PREVIEW_WORDS = 6;
+
+    private final DocumentTextExtractor textExtractor = new DocumentTextExtractor();
+
+    public AnalysisResponse analyze(List<MultipartFile> files) throws IOException, ExtractionException {
+        validateInput(files);
+
+        List<String> stages = new ArrayList<>();
+
+        // Stage 1: load documents
+        stages.add("Documents loaded");
+
+        // Stage 2: extract plain text from each document (TXT / PDF / DOCX),
+        // then normalize and split it into words
+        List<Document> documents = preprocess(files);
+        stages.add("Text extracted from all documents (TXT/PDF/DOCX)");
+        stages.add("Text normalized and tokenized into word IDs");
+
+        // Stage 3-4: word IDs + sentinels -> Suffix Array -> Kasai -> LCP (all inside the analyzer)
+        CommonWordSequenceAnalyzer analyzer = new CommonWordSequenceAnalyzer(documents, MIN_SEQUENCE_WORDS);
+        stages.add("Suffix Array constructed");
+        stages.add("LCP Array constructed");
+
+        // Stage 5: common word sequences (suffix-array-derived matches)
+        List<CommonWordSequence> rawMatches = analyzer.findRawMatches();
+        stages.add("Common word sequences identified");
+
+        // Stage 6: overlap merging + similarity scoring
+        List<SimilarityResult> similarityResults =
+                computeSimilarities(documents, rawMatches, analyzer.getCombinedTokens());
+        stages.add("Similarity scores calculated");
+
+        // Stage 7: ranking
+        rank(similarityResults);
+        stages.add("Documents ranked");
+
+        // Build response payloads
+        List<DocumentResult> documentResults = new ArrayList<>();
+        for (Document d : documents) {
+            documentResults.add(new DocumentResult(d.getId(), d.getFilename(), d.length(), d.wordCount(),
+                    d.getSourceFormat(), "SUCCESS"));
+        }
+
+        double highest = similarityResults.stream()
+                .mapToDouble(SimilarityResult::getSimilarityPercent)
+                .max().orElse(0.0);
+
+        int totalSequences = similarityResults.stream()
+                .mapToInt(SimilarityResult::getTotalCommonSequences)
+                .sum();
+
+        AnalysisResponse.Summary summary = new AnalysisResponse.Summary(
+                documents.size(),
+                similarityResults.size(),
+                totalSequences,
+                round2(highest)
+        );
+
+        AlgorithmDetails algorithmDetails = buildAlgorithmDetails(documents, analyzer, totalSequences, similarityResults);
+
+        return new AnalysisResponse(documentResults, similarityResults, summary, algorithmDetails, stages);
     }
 
-    // =========================================================================================
-    // Full analysis
-    // =========================================================================================
-
-    public AnalysisResponse analyze(List<DocumentInput> input, Integer requestedMinMatchLength) {
-        final long analysisStart = System.nanoTime();
-        final int minMatchLength = validator.resolveMinMatchLength(requestedMinMatchLength);
-        final List<DocumentInput> documents = validator.validate(input);
-        final int k = documents.size();
-        final List<AnalysisStage> stages = new ArrayList<>();
-
-        // 1. Documents loaded -------------------------------------------------------------------
-        long t = System.nanoTime();
-        long rawChars = documents.stream().mapToLong(d -> d.content().length()).sum();
-        stages.add(stage("load", "Documents loaded", t,
-                fmt("%d documents received, %,d characters in total", k, rawChars)));
-
-        // 2. Preprocessing ----------------------------------------------------------------------
-        t = System.nanoTime();
-        List<ProcessedText> processed = new ArrayList<>(k);
-        for (DocumentInput doc : documents) {
-            ProcessedText p = TextPreprocessor.process(doc.content());
-            if (p.text().isEmpty()) {
-                throw ApiException.badRequest("Document '" + doc.name()
-                        + "' contains no letters or digits, so there is no text to compare.");
-            }
-            processed.add(p);
+    /**
+     * Sorts by similarity, highest first. Ties are broken by shared words and
+     * then by document IDs so the ranking is deterministic.
+     */
+    static void rank(List<SimilarityResult> results) {
+        results.sort(Comparator.comparingDouble(SimilarityResult::getSimilarityPercent).reversed()
+                .thenComparing(Comparator.comparingInt(SimilarityResult::getSharedWords).reversed())
+                .thenComparingInt(SimilarityResult::getDocAId)
+                .thenComparingInt(SimilarityResult::getDocBId));
+        for (int i = 0; i < results.size(); i++) {
+            results.get(i).setRank(i + 1);
         }
-        long processedChars = processed.stream().mapToLong(p -> p.text().length()).sum();
-        stages.add(stage("preprocess", "Text preprocessing completed", t,
-                fmt("Lower case, punctuation removed, whitespace collapsed: %,d to %,d characters",
-                        rawChars, processedChars)));
-
-        // 3. Combined text with unique separators --------------------------------------------------
-        t = System.nanoTime();
-        CombinedText combined = CombinedText.of(processed.stream().map(ProcessedText::text).toList());
-        final int n = combined.length();
-        stages.add(stage("combine", "Combined text built", t,
-                fmt("n = %,d symbols: %,d characters plus %d unique separators, alphabet size %d",
-                        n, processedChars, k, combined.alphabetSize())));
-
-        // 4. Suffix Array ------------------------------------------------------------------------
-        t = System.nanoTime();
-        SuffixArray suffixArray = SuffixArray.build(combined.symbols());
-        int[] sa = suffixArray.getArray();
-        stages.add(stage("suffix-array", "Suffix Array constructed", t,
-                fmt("%,d suffixes sorted by prefix doubling in %d rounds", n, suffixArray.getDoublingRounds())));
-
-        // 5. LCP Array with Kasai, followed by the consistency check ---------------------------------
-        t = System.nanoTime();
-        int[] lcp = KasaiLCP.compute(suffixArray);
-        boolean verified = SuffixArrayVerifier.verify(combined.symbols(), sa, lcp);
-        if (!verified) {
-            throw new IllegalStateException("Suffix Array or LCP Array failed the consistency check");
-        }
-        int maxLcp = 0;
-        long lcpSum = 0;
-        int crossDocumentNeighbours = 0;
-        for (int r = 0; r < n; r++) {
-            maxLcp = Math.max(maxLcp, lcp[r]);
-            lcpSum += lcp[r];
-            if (r > 0 && lcp[r] >= minMatchLength
-                    && combined.documentOf(sa[r]) != combined.documentOf(sa[r - 1])) {
-                crossDocumentNeighbours++;
-            }
-        }
-        stages.add(stage("lcp", "LCP Array constructed (Kasai)", t,
-                fmt("Kasai algorithm, max LCP %,d. Suffix Array and LCP consistency check passed", maxLcp)));
-
-        // 6. Common substrings -------------------------------------------------------------------
-        t = System.nanoTime();
-        CommonSubstringAnalyzer.Result common = new CommonSubstringAnalyzer(combined, sa, lcp)
-                .analyze(minMatchLength, settings.maxSegmentsPerPair());
-        stages.add(stage("common-substrings", "Common substrings identified", t,
-                fmt("%,d maximal common segments of at least %d characters across %d pairs",
-                        common.totalSegments(), minMatchLength, common.pairs().size())));
-
-        // 7. Similarity --------------------------------------------------------------------------
-        t = System.nanoTime();
-        List<PairScore> scores = new ArrayList<>();
-        for (CommonSubstringAnalyzer.PairMatches pair : common.pairs()) {
-            scores.add(SimilarityCalculator.score(pair,
-                    combined.documentLength(pair.documentA()), combined.documentLength(pair.documentB())));
-        }
-        stages.add(stage("similarity", "Similarity scores calculated", t,
-                fmt("%d pairs scored with (Shared(A,B) + Shared(B,A)) / (|A| + |B|)", scores.size())));
-
-        // 8. Ranking -----------------------------------------------------------------------------
-        t = System.nanoTime();
-        List<PairScore> ranked = PairRanker.rank(scores);
-        PairScore best = ranked.get(0);
-        stages.add(stage("ranking", "Documents ranked", t,
-                fmt("%d pairs ordered by similarity, highest %.2f%%", ranked.size(), best.similarity() * 100)));
-
-        // Keep the arrays for the paged Suffix Array view.
-        String id = UUID.randomUUID().toString();
-        List<String> names = documents.stream().map(DocumentInput::name).toList();
-        store.save(new AnalysisStore.StoredAnalysis(id, combined, sa, lcp, names, minMatchLength));
-
-        // Build the response ----------------------------------------------------------------------
-        List<DocumentResult> documentResults = new ArrayList<>(k);
-        for (int d = 0; d < k; d++) {
-            ProcessedText p = processed.get(d);
-            documentResults.add(new DocumentResult(d, names.get(d), documents.get(d).content().length(),
-                    p.text().length(), p.wordCount(), p.lineCount(),
-                    combined.documentStart(d), combined.separatorPosition(d)));
-        }
-
-        List<SimilarityResult> ranking = new ArrayList<>(ranked.size());
-        double[][] matrix = new double[k][k];
-        for (int d = 0; d < k; d++) {
-            matrix[d][d] = 100.0;
-        }
-        for (int i = 0; i < ranked.size(); i++) {
-            PairScore score = ranked.get(i);
-            ranking.add(toSimilarityResult(i + 1, score, names, combined, processed));
-            matrix[score.documentA()][score.documentB()] = score.similarity() * 100;
-            matrix[score.documentB()][score.documentA()] = score.similarity() * 100;
-        }
-
-        double totalMs = (System.nanoTime() - analysisStart) / 1_000_000.0;
-        AnalysisSummary summary = new AnalysisSummary(k, ranked.size(), common.totalSegments(),
-                best.similarity() * 100, names.get(best.documentA()), names.get(best.documentB()), n, totalMs);
-
-        AlgorithmInfo algorithm = new AlgorithmInfo(n, combined.alphabetSize(), k,
-                "Prefix doubling with radix sort", "O(n log n)", suffixArray.getDoublingRounds(), verified,
-                "Kasai", "O(n)", maxLcp, n == 0 ? 0 : (double) lcpSum / n, crossDocumentNeighbours, FORMULA);
-
-        return new AnalysisResponse(id,
-                new AnalysisParameters(minMatchLength, settings.maxSegmentsPerPair(), settings.segmentPreviewChars()),
-                documentResults, summary, stages, ranking, matrix, algorithm);
     }
 
-    private SimilarityResult toSimilarityResult(int rank, PairScore score, List<String> names,
-                                                CombinedText combined, List<ProcessedText> processed) {
-        CommonSubstringAnalyzer.PairMatches m = score.matches();
-        int a = m.documentA();
-        int b = m.documentB();
-        List<CommonSubstring> segments = new ArrayList<>(m.topSegments().size());
-        for (CommonSubstringAnalyzer.Segment s : m.topSegments()) {
-            int shown = Math.min(s.length(), settings.segmentPreviewChars());
-            String text = combined.text(combined.documentStart(a) + s.offsetA(), shown);
-            segments.add(new CommonSubstring(text, s.length(), s.offsetA(), s.offsetB(),
-                    processed.get(a).lineOf(s.offsetA()), processed.get(b).lineOf(s.offsetB()),
-                    shown < s.length()));
-        }
-        return new SimilarityResult(rank, a, names.get(a), b, names.get(b),
-                score.similarity() * 100, m.sharedCharsA(), m.sharedCharsB(),
-                score.lengthA(), score.lengthB(), score.coverageA() * 100, score.coverageB() * 100,
-                m.effectiveMinLength(), m.segmentCount(), m.longestSegment(), segments);
-    }
+    // ------------------------------------------------------------------
+    // Validation
+    // ------------------------------------------------------------------
 
-    // =========================================================================================
-    // Paged Suffix Array and LCP table
-    // =========================================================================================
-
-    public SuffixArrayPage suffixArrayPage(String analysisId, int page, int pageSize) {
-        AnalysisStore.StoredAnalysis stored = store.find(analysisId).orElseThrow(() -> ApiException.notFound(
-                "Analysis '" + analysisId + "' was not found. It may have expired, please run the analysis again."));
-        if (pageSize < 1 || pageSize > MAX_PAGE_SIZE) {
-            throw ApiException.badRequest("Page size must be between 1 and " + MAX_PAGE_SIZE + ".");
+    private void validateInput(List<MultipartFile> files) {
+        if (files == null || files.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "No documents were provided. Please upload at least 2 documents (TXT, PDF, or DOCX).");
         }
-        CombinedText text = stored.text();
-        int[] sa = stored.suffixArray();
-        int[] lcp = stored.lcp();
-        int n = sa.length;
-        int totalPages = (n + pageSize - 1) / pageSize;
-        if (page < 0 || page >= totalPages) {
-            throw ApiException.badRequest("Page must be between 0 and " + (totalPages - 1) + ".");
+        if (files.size() < 2) {
+            throw new IllegalArgumentException("At least 2 documents are required for similarity analysis.");
         }
-
-        List<SuffixArrayRow> rows = new ArrayList<>(pageSize);
-        for (int r = page * pageSize; r < Math.min(n, (page + 1) * pageSize); r++) {
-            int pos = sa[r];
-            int doc = text.documentOf(pos);
-            // The common prefix never contains a separator (separators are unique), so it is plain text.
-            int prefixLength = Math.min(lcp[r], SA_PREVIEW_SYMBOLS);
-            String commonPrefix = text.text(pos, prefixLength);
-            String rest = text.preview(pos + prefixLength, SA_PREVIEW_SYMBOLS - prefixLength);
-            boolean cross = r > 0 && lcp[r] >= stored.minMatchLength()
-                    && text.documentOf(sa[r - 1]) != doc;
-            rows.add(new SuffixArrayRow(r, pos, doc, stored.documentNames().get(doc),
-                    text.offsetInDocument(pos), text.isSeparator(pos), lcp[r], commonPrefix, rest, cross));
-        }
-        return new SuffixArrayPage(analysisId, page, pageSize, n, totalPages, stored.minMatchLength(), rows);
-    }
-
-    // =========================================================================================
-    // Suffix Array playground for a short string
-    // =========================================================================================
-
-    public DemoResponse demo(String text) {
-        if (text == null || text.isEmpty()) {
-            throw ApiException.badRequest("Enter a string to build its Suffix Array, for example 'banana'.");
-        }
-        if (text.length() > MAX_DEMO_LENGTH) {
-            throw ApiException.badRequest("The playground accepts at most " + MAX_DEMO_LENGTH + " characters.");
-        }
-        for (int i = 0; i < text.length(); i++) {
-            if (Character.isISOControl(text.charAt(i))) {
-                throw ApiException.badRequest("The playground string must not contain control characters.");
+        for (MultipartFile f : files) {
+            String name = f.getOriginalFilename();
+            if (f.isEmpty()) {
+                throw new IllegalArgumentException("Document '" + name + "' is empty.");
             }
         }
-        SuffixArray suffixArray = SuffixArray.fromString(text);
-        int[] sa = suffixArray.getArray();
-        int[] lcp = KasaiLCP.compute(suffixArray);
-        List<DemoResponse.Row> rows = new ArrayList<>(sa.length);
-        for (int r = 0; r < sa.length; r++) {
-            rows.add(new DemoResponse.Row(r, sa[r], text.substring(sa[r]), lcp[r]));
+    }
+
+    // ------------------------------------------------------------------
+    // Extraction + preprocessing
+    // ------------------------------------------------------------------
+
+    /**
+     * Extracts plain text from each uploaded file (dispatching to the TXT, PDF,
+     * or DOCX extractor by extension) and applies light whitespace cleanup.
+     * Format-specific concerns (unsupported extension, corrupt file,
+     * scanned/image-only PDF with no text layer) are all resolved here, before
+     * anything reaches the DSA pipeline. Each Document then tokenizes its text
+     * into normalized words (WordTokenizer).
+     */
+    private List<Document> preprocess(List<MultipartFile> files) throws IOException, ExtractionException {
+        List<Document> documents = new ArrayList<>();
+        int id = 0;
+        for (MultipartFile f : files) {
+            String filename = f.getOriginalFilename();
+            String extractedText = textExtractor.extract(f.getBytes(), filename);
+            String sourceFormat = textExtractor.formatOf(filename);
+
+            String cleaned = preprocessText(extractedText);
+            if (cleaned.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "Document '" + filename + "' has no usable text content after preprocessing.");
+            }
+            Document document = new Document(id, filename, cleaned, sourceFormat);
+            if (document.wordCount() == 0) {
+                throw new IllegalArgumentException(
+                        "Document '" + filename + "' contains no words to compare (only punctuation or symbols).");
+            }
+            documents.add(document);
+            id++;
         }
-        return new DemoResponse(text, text.length(), suffixArray.getDoublingRounds(), sa, lcp, rows);
+        return documents;
     }
 
-    // =========================================================================================
-
-    private static AnalysisStage stage(String key, String name, long startNanos, String detail) {
-        double ms = (System.nanoTime() - startNanos) / 1_000_000.0;
-        return new AnalysisStage(key, name, "completed", ms, detail);
+    /**
+     * Normalizes line endings and collapses runs of whitespace. Case,
+     * punctuation and word splitting are handled by WordTokenizer.
+     */
+    private String preprocessText(String raw) {
+        String normalized = raw.replace("\r\n", "\n").replace('\r', '\n');
+        normalized = normalized.replaceAll("[ \\t]+", " ");
+        normalized = normalized.replaceAll("\\n{3,}", "\n\n");
+        return normalized.trim();
     }
 
-    private static String fmt(String pattern, Object... args) {
-        return String.format(Locale.US, pattern, args);
+    // ------------------------------------------------------------------
+    // Similarity computation
+    // ------------------------------------------------------------------
+
+    private List<SimilarityResult> computeSimilarities(List<Document> documents, List<CommonWordSequence> rawMatches,
+                                                       TokenCombiner.CombinedTokens combined) {
+        Map<String, List<CommonWordSequence>> byPair = new LinkedHashMap<>();
+
+        // Ensure every pair is present, even with zero matches (similarity 0%)
+        for (int i = 0; i < documents.size(); i++) {
+            for (int j = i + 1; j < documents.size(); j++) {
+                byPair.put(pairKey(documents.get(i).getId(), documents.get(j).getId()), new ArrayList<>());
+            }
+        }
+        for (CommonWordSequence m : rawMatches) {
+            byPair.get(pairKey(m.getDocAId(), m.getDocBId())).add(m);
+        }
+
+        Map<Integer, Document> docById = new HashMap<>();
+        for (Document d : documents) {
+            docById.put(d.getId(), d);
+        }
+
+        List<SimilarityResult> results = new ArrayList<>();
+
+        for (Map.Entry<String, List<CommonWordSequence>> entry : byPair.entrySet()) {
+            String[] parts = entry.getKey().split("-");
+            Document docA = docById.get(Integer.parseInt(parts[0]));
+            Document docB = docById.get(Integer.parseInt(parts[1]));
+
+            // Merge overlapping matches on the same alignment into maximal sequences.
+            List<CommonWordSequence> merged = CommonSequenceMerger.mergeOnDiagonals(entry.getValue(), combined);
+
+            // Count each shared word once: union of the merged intervals, per side.
+            int sharedA = mergedCoverage(merged, true);
+            int sharedB = mergedCoverage(merged, false);
+            int sharedWords = Math.min(sharedA, sharedB);
+
+            double similarity = similarityPercent(sharedWords, docA.wordCount(), docB.wordCount());
+
+            List<CommonWordSequence> distinct = CommonSequenceMerger.dropContained(merged);
+            List<CommonWordSequence> top = distinct.size() > MAX_SEQUENCES_PER_PAIR
+                    ? new ArrayList<>(distinct.subList(0, MAX_SEQUENCES_PER_PAIR))
+                    : distinct;
+
+            results.add(new SimilarityResult(
+                    docA.getId(), docB.getId(),
+                    docA.getFilename(), docB.getFilename(),
+                    round2(similarity),
+                    docA.wordCount(), docB.wordCount(),
+                    sharedA, sharedB, sharedWords,
+                    distinct.size(),
+                    top
+            ));
+        }
+
+        return results;
+    }
+
+    /** Similarity(A,B) = (2 x sharedWords / (wordCountA + wordCountB)) x 100 */
+    static double similarityPercent(int sharedWords, int wordCountA, int wordCountB) {
+        int total = wordCountA + wordCountB;
+        return total == 0 ? 0.0 : (2.0 * sharedWords / total) * 100.0;
+    }
+
+    /**
+     * Merges the [offset, offset + wordCount) intervals of every sequence (in
+     * either A's or B's word coordinates, per the useA flag) and returns the
+     * number of distinct words covered. A word covered by several overlapping
+     * sequences is counted once.
+     */
+    static int mergedCoverage(List<CommonWordSequence> sequences, boolean useA) {
+        if (sequences.isEmpty()) return 0;
+
+        List<int[]> intervals = new ArrayList<>();
+        for (CommonWordSequence m : sequences) {
+            int start = useA ? m.getOffsetInA() : m.getOffsetInB();
+            intervals.add(new int[]{start, start + m.getWordCount()});
+        }
+        intervals.sort((a, b) -> Integer.compare(a[0], b[0]));
+
+        int total = 0;
+        int curStart = intervals.get(0)[0];
+        int curEnd = intervals.get(0)[1];
+
+        for (int i = 1; i < intervals.size(); i++) {
+            int[] iv = intervals.get(i);
+            if (iv[0] <= curEnd) {
+                curEnd = Math.max(curEnd, iv[1]);
+            } else {
+                total += (curEnd - curStart);
+                curStart = iv[0];
+                curEnd = iv[1];
+            }
+        }
+        total += (curEnd - curStart);
+        return total;
+    }
+
+    private String pairKey(int a, int b) {
+        int lo = Math.min(a, b);
+        int hi = Math.max(a, b);
+        return lo + "-" + hi;
+    }
+
+    // ------------------------------------------------------------------
+    // Algorithm details / technical view
+    // ------------------------------------------------------------------
+
+    private AlgorithmDetails buildAlgorithmDetails(List<Document> documents, CommonWordSequenceAnalyzer analyzer,
+                                                   int totalSequences, List<SimilarityResult> results) {
+        int[] sa = analyzer.getSuffixArray().getSuffixArray();
+        int[] lcp = analyzer.getKasaiLCP().getLCPArray();
+        TokenCombiner.CombinedTokens combined = analyzer.getCombinedTokens();
+
+        Map<Integer, String> nameById = new HashMap<>();
+        for (Document d : documents) nameById.put(d.getId(), d.getFilename());
+
+        List<SuffixArrayEntry> sample = new ArrayList<>();
+        int limit = Math.min(sa.length, MAX_SA_SAMPLE_ROWS);
+        for (int i = 0; i < limit; i++) {
+            int pos = sa[i];
+            int docId = combined.docIdAtPosition[pos];
+            String docName = (docId == -1) ? "(boundary)" : nameById.get(docId);
+            int offset = combined.offsetAtPosition[pos];
+
+            // Word-based preview: the suffix's first words, rebuilt from token IDs,
+            // stopping after the document's sentinel.
+            StringBuilder preview = new StringBuilder();
+            for (int p = pos; p < combined.length() && p < pos + SUFFIX_PREVIEW_WORDS; p++) {
+                if (preview.length() > 0) preview.append(' ');
+                preview.append(combined.wordAt(p));
+                if (combined.isSentinel(p)) break;
+            }
+
+            sample.add(new SuffixArrayEntry(i, pos, docName, offset, lcp[i], preview.toString()));
+        }
+
+        return new AlgorithmDetails(
+                documents.size(),
+                combined.length(),
+                combined.vocabulary.size(),
+                true,
+                true,
+                true,
+                analyzer.getRawSuffixMatchCount(),
+                totalSequences,
+                results.size(),
+                MIN_SEQUENCE_WORDS,
+                sa.length,
+                sample
+        );
+    }
+
+    private double round2(double v) {
+        return Math.round(v * 100.0) / 100.0;
     }
 }

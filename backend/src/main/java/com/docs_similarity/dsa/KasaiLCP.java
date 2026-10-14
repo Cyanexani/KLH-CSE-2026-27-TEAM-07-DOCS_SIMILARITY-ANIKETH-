@@ -1,87 +1,83 @@
 package com.docs_similarity.dsa;
 
 /**
- * Builds the <b>LCP Array</b> from a Suffix Array using the <b>Kasai algorithm</b>
- * (Kasai, Lee, Arimura, Arikawa and Park, 2001).
+ * KasaiLCP
+ * ------------------------------------------------------------------
+ * Genuine implementation of Kasai's Algorithm for building the
+ * LCP (Longest Common Prefix) array from a Suffix Array in O(n) time.
  *
- * <h2>What is the LCP Array?</h2>
- * LCP stands for Longest Common Prefix. In this project:
- * <pre>
- *   lcp[0] = 0                                      (the first suffix has no predecessor)
- *   lcp[r] = length of the longest common prefix of the suffixes SA[r-1] and SA[r]
- * </pre>
- * Example for T = "banana":
- * <pre>
- *   r  SA  suffix   lcp
- *   0  5   a        0
- *   1  3   ana      1   ("a")
- *   2  1   anana    3   ("ana")
- *   3  0   banana   0
- *   4  4   na       0
- *   5  2   nana     2   ("na")
- * </pre>
+ * LCP[i] = length of the longest common prefix between the suffix
+ *          at suffixArray[i] and the suffix at suffixArray[i-1]
+ *          (i.e. between consecutive suffixes in sorted order).
+ * LCP[0] is conventionally 0 (no predecessor).
  *
- * <h2>Why Kasai is fast</h2>
- * Comparing every pair of neighbouring suffixes from scratch costs O(n^2) in the worst case.
- * Kasai visits the suffixes in <i>text order</i> (i = 0, 1, 2, ...) and uses one lemma:
- * <blockquote>
- *   If suffix i shares h symbols with the suffix just before it in the Suffix Array,
- *   then suffix i+1 shares at least h-1 symbols with the suffix just before it.
- * </blockquote>
- * (Remove the first symbol from both suffixes: the shorter pair still matches in h-1 symbols,
- * and its predecessor in sorted order can only share more.)
- * So the match length h never restarts from zero. It drops by at most 1 per step and can grow
- * at most n times in total, which gives <b>O(n) time</b>.
+ * The Suffix Array in this project is built over WORD token IDs, so
+ * the prefix is compared token by token and LCP[i] is a NUMBER OF
+ * WORDS: LCP[i] = 3 means the two neighbouring suffixes start with the
+ * same three words.
+ *
+ * WHY KASAI'S ALGORITHM?
+ * Computing each LCP[i] directly by comparing full suffixes costs
+ * O(n) per pair, giving O(n^2) overall. Kasai's insight is that as
+ * we walk through the ORIGINAL sequence order (not sorted order), the
+ * LCP length can only decrease by at most 1 between consecutive
+ * original positions. This "at most drop by 1" property means the
+ * total amount of token comparison work across the whole sequence
+ * is bounded by O(n), because every increment of the shared match
+ * length is "paid for" once and only decremented gradually.
+ *
+ * Algorithm:
+ *  1. Compute rank[] = inverse of the suffix array (rank[i] = position
+ *     of suffix i in the sorted suffix array). SuffixArray already
+ *     provides this.
+ *  2. Walk i = 0 .. n-1 over the sequence in original order.
+ *  3. If rank[i] &gt; 0, let j = suffixArray[rank[i]-1] (the suffix that
+ *     sits immediately before suffix i in sorted order).
+ *  4. Extend the match length h from where it left off (never resetting
+ *     to 0 unnecessarily) while tokens[i+h] == tokens[j+h].
+ *  5. LCP[rank[i]] = h.
+ *  6. Decrease h by 1 (but not below 0) before moving to i+1.
  */
-public final class KasaiLCP {
+public class KasaiLCP {
 
-    private KasaiLCP() {
+    private final int[] lcp;
+
+    public KasaiLCP(SuffixArray suffixArray) {
+        this.lcp = build(suffixArray);
     }
 
-    /**
-     * Computes the LCP Array.
-     *
-     * @param text        the text the Suffix Array was built from
-     * @param suffixArray the Suffix Array of {@code text}
-     * @return lcp where lcp[r] = LCP(suffix SA[r-1], suffix SA[r]) and lcp[0] = 0
-     */
-    public static int[] compute(int[] text, int[] suffixArray) {
-        final int n = text.length;
-        if (suffixArray.length != n) {
-            throw new IllegalArgumentException("Suffix Array length does not match text length");
-        }
-        int[] lcp = new int[n];
-
-        // rankOf[i] = position of suffix i inside the Suffix Array (the inverse permutation).
-        int[] rankOf = new int[n];
-        for (int r = 0; r < n; r++) {
-            rankOf[suffixArray[r]] = r;
-        }
-
-        int h = 0; // number of symbols already known to match
-        for (int i = 0; i < n; i++) {            // visit suffixes in TEXT order
-            if (rankOf[i] == 0) {
-                h = 0;                           // first suffix in sorted order: no predecessor
-                continue;
-            }
-            int j = suffixArray[rankOf[i] - 1];  // suffix that precedes suffix i in sorted order
-
-            // Extend the match beyond the h symbols we already know are equal.
-            while (i + h < n && j + h < n && text[i + h] == text[j + h]) {
-                h++;
-            }
-            lcp[rankOf[i]] = h;
-
-            // Kasai lemma: the next suffix (i + 1) matches its predecessor in at least h - 1 symbols.
-            if (h > 0) {
-                h--;
-            }
-        }
+    public int[] getLCPArray() {
         return lcp;
     }
 
-    /** Convenience overload for a {@link SuffixArray} object. */
-    public static int[] compute(SuffixArray suffixArray) {
-        return compute(suffixArray.getText(), suffixArray.getArray());
+    private int[] build(SuffixArray sa) {
+        int[] tokens = sa.getTokens();
+        int n = sa.length();
+        int[] suffixArr = sa.getSuffixArray();
+        int[] rank = sa.getRank();
+
+        int[] lcp = new int[n];
+        int h = 0;
+
+        for (int i = 0; i < n; i++) {
+            if (rank[i] > 0) {
+                int j = suffixArr[rank[i] - 1];
+
+                while (i + h < n && j + h < n && tokens[i + h] == tokens[j + h]) {
+                    h++;
+                }
+
+                lcp[rank[i]] = h;
+
+                if (h > 0) {
+                    h--;
+                }
+            } else {
+                // First suffix in sorted order has no predecessor to compare against
+                h = 0;
+            }
+        }
+
+        return lcp;
     }
 }

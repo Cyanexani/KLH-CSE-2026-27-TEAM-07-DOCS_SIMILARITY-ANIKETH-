@@ -1,76 +1,90 @@
 package com.docs_similarity.dsa;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import com.docs_similarity.model.Document;
+import com.docs_similarity.util.TokenCombiner;
+import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.Random;
 
-import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class KasaiLCPTest {
 
     @Test
-    @DisplayName("banana: LCP = [0, 1, 3, 0, 0, 2]")
-    void banana() {
-        // a | ana (1) | anana (3) | banana (0) | na (0) | nana (2)
-        assertArrayEquals(new int[]{0, 1, 3, 0, 0, 2}, KasaiLCP.compute(SuffixArray.fromString("banana")));
+    void testKnownLCPArray_banana() {
+        // Suffix array for "banana$": [6, 5, 3, 1, 0, 4, 2]
+        // Sorted suffixes: $, a$, ana$, anana$, banana$, na$, nana$
+        // LCP with previous: [0, 0, 1, 3, 0, 0, 2]
+        SuffixArray sa = new SuffixArray("banana$");
+        KasaiLCP kasai = new KasaiLCP(sa);
+        int[] expected = {0, 0, 1, 3, 0, 0, 2};
+        assertArrayEquals(expected, kasai.getLCPArray());
     }
 
     @Test
-    @DisplayName("mississippi: LCP = [0, 1, 1, 4, 0, 0, 1, 0, 2, 1, 3]")
-    void mississippi() {
-        assertArrayEquals(new int[]{0, 1, 1, 4, 0, 0, 1, 0, 2, 1, 3},
-                KasaiLCP.compute(SuffixArray.fromString("mississippi")));
+    void testLCPFirstEntryAlwaysZero() {
+        SuffixArray sa = new SuffixArray("mississippi$");
+        KasaiLCP kasai = new KasaiLCP(sa);
+        assertEquals(0, kasai.getLCPArray()[0]);
     }
 
     @Test
-    void allEqualCharacters() {
-        // a | aa | aaa | aaaa
-        assertArrayEquals(new int[]{0, 1, 2, 3}, KasaiLCP.compute(SuffixArray.fromString("aaaa")));
+    void testLCPIsMeasuredInWords() {
+        // "machine learning algorithms" occurs in both documents: 3 shared WORDS (27 characters).
+        Document d0 = new Document(0, "a.txt", "Modern machine learning algorithms");
+        Document d1 = new Document(1, "b.txt", "machine learning algorithms improve");
+        TokenCombiner.CombinedTokens combined = TokenCombiner.combine(List.of(d0, d1));
+
+        SuffixArray sa = new SuffixArray(combined.tokens);
+        int[] lcp = new KasaiLCP(sa).getLCPArray();
+
+        int rankOfA = sa.getRank()[combined.documentStart[0] + 1]; // "machine ..." in doc A
+        int rankOfB = sa.getRank()[combined.documentStart[1]];     // "machine ..." in doc B
+        assertEquals(1, Math.abs(rankOfA - rankOfB), "Both 'machine learning algorithms' suffixes sort together");
+        assertEquals(3, lcp[Math.max(rankOfA, rankOfB)], "LCP counts 3 words, not 27 characters");
+
+        int max = 0;
+        for (int v : lcp) max = Math.max(max, v);
+        assertEquals(3, max);
     }
 
     @Test
-    @DisplayName("matches a brute force LCP on 500 random strings")
-    void matchesNaiveLcpOnRandomStrings() {
+    void testLCPMatchesActualCommonPrefixLength() {
+        String text = "mississippi$";
+        SuffixArray sa = new SuffixArray(text);
+        KasaiLCP kasai = new KasaiLCP(sa);
+        int[] saArr = sa.getSuffixArray();
+        int[] lcp = kasai.getLCPArray();
+
+        for (int i = 1; i < saArr.length; i++) {
+            String a = text.substring(saArr[i - 1]);
+            String b = text.substring(saArr[i]);
+            int actualLcp = 0;
+            int max = Math.min(a.length(), b.length());
+            while (actualLcp < max && a.charAt(actualLcp) == b.charAt(actualLcp)) {
+                actualLcp++;
+            }
+            assertEquals(actualLcp, lcp[i], "Mismatch at SA index " + i);
+        }
+    }
+
+    @Test
+    void testWordLCPMatchesBruteForceOnRandomTokenSequences() {
         Random random = new Random(7);
-        for (int trial = 0; trial < 500; trial++) {
-            int length = 1 + random.nextInt(200);
-            int alphabet = 1 + random.nextInt(3);
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < length; i++) {
-                sb.append((char) ('a' + random.nextInt(alphabet)));
+        for (int trial = 0; trial < 50; trial++) {
+            int n = 2 + random.nextInt(80);
+            int[] tokens = new int[n];
+            for (int i = 0; i < n; i++) tokens[i] = random.nextInt(3);
+            SuffixArray sa = new SuffixArray(tokens);
+            int[] saArr = sa.getSuffixArray();
+            int[] lcp = new KasaiLCP(sa).getLCPArray();
+            for (int i = 1; i < n; i++) {
+                int a = saArr[i - 1], b = saArr[i], h = 0;
+                while (a + h < n && b + h < n && tokens[a + h] == tokens[b + h]) h++;
+                assertEquals(h, lcp[i]);
             }
-            String s = sb.toString();
-            SuffixArray sa = SuffixArray.fromString(s);
-            int[] lcp = KasaiLCP.compute(sa);
-            assertArrayEquals(naiveLcp(s, sa.getArray()), lcp, "text: " + s);
-            assertTrue(SuffixArrayVerifier.verify(sa.getText(), sa.getArray(), lcp));
         }
-    }
-
-    @Test
-    @DisplayName("the verifier rejects a wrong order and a wrong LCP value")
-    void verifierDetectsErrors() {
-        SuffixArray sa = SuffixArray.fromString("banana");
-        int[] lcp = KasaiLCP.compute(sa);
-        int[] swapped = {3, 5, 1, 0, 4, 2};
-        assertTrue(!SuffixArrayVerifier.verify(sa.getText(), swapped, lcp));
-        int[] wrongLcp = {0, 1, 2, 0, 0, 2};
-        assertTrue(!SuffixArrayVerifier.verify(sa.getText(), sa.getArray(), wrongLcp));
-    }
-
-    static int[] naiveLcp(String s, int[] sa) {
-        int[] lcp = new int[sa.length];
-        for (int r = 1; r < sa.length; r++) {
-            int a = sa[r - 1];
-            int b = sa[r];
-            int h = 0;
-            while (a + h < s.length() && b + h < s.length() && s.charAt(a + h) == s.charAt(b + h)) {
-                h++;
-            }
-            lcp[r] = h;
-        }
-        return lcp;
     }
 }

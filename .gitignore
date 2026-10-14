@@ -1,10 +1,6 @@
 target/
 node_modules/
-dist/
-build/
-.env
-.env.*
-*.log
+*.class
 .idea/
-.vscode/
-.DS_Store
+*.iml
+dist/

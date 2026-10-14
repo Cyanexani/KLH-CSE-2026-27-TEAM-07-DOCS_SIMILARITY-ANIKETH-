@@ -1,89 +1,106 @@
 package com.docs_similarity.dsa;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import com.docs_similarity.model.Document;
+import com.docs_similarity.util.TokenCombiner;
+import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
+import java.util.List;
 import java.util.Random;
 
-import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
 
 class SuffixArrayTest {
 
+    // ---- classic character examples (each char is one symbol) ----
+
     @Test
-    @DisplayName("banana: textbook example")
-    void banana() {
-        // a(5) ana(3) anana(1) banana(0) na(4) nana(2)
-        assertArrayEquals(new int[]{5, 3, 1, 0, 4, 2}, SuffixArray.fromString("banana").getArray());
+    void testKnownSuffixArray_banana() {
+        // "banana$" -> classic textbook example
+        SuffixArray sa = new SuffixArray("banana$");
+        int[] expected = {6, 5, 3, 1, 0, 4, 2};
+        assertArrayEquals(expected, sa.getSuffixArray());
     }
 
     @Test
-    @DisplayName("mississippi: repeated substrings")
-    void mississippi() {
-        assertArrayEquals(new int[]{10, 7, 4, 1, 0, 9, 8, 6, 3, 5, 2},
-                SuffixArray.fromString("mississippi").getArray());
+    void testSuffixesAreLexicographicallySorted() {
+        String text = "mississippi$";
+        SuffixArray sa = new SuffixArray(text);
+        int[] arr = sa.getSuffixArray();
+
+        for (int i = 1; i < arr.length; i++) {
+            String prev = text.substring(arr[i - 1]);
+            String cur = text.substring(arr[i]);
+            assertTrue(prev.compareTo(cur) < 0,
+                    "Suffix at index " + (i - 1) + " should sort before index " + i);
+        }
     }
 
     @Test
-    @DisplayName("a run of equal characters: shorter suffixes come first")
-    void allEqualCharacters() {
-        assertArrayEquals(new int[]{3, 2, 1, 0}, SuffixArray.fromString("aaaa").getArray());
+    void testSingleCharacter() {
+        SuffixArray sa = new SuffixArray("a");
+        assertArrayEquals(new int[]{0}, sa.getSuffixArray());
     }
 
     @Test
-    void singleCharacterAndEmptyText() {
-        assertArrayEquals(new int[]{0}, SuffixArray.fromString("x").getArray());
-        assertArrayEquals(new int[0], SuffixArray.fromString("").getArray());
+    void testAllSameCharacters() {
+        // "aaaa$" - suffixes: a$, aa$, aaa$, aaaa$, $  -> sorted: $, a$, aa$, aaa$, aaaa$
+        SuffixArray sa = new SuffixArray("aaaa$");
+        int[] expected = {4, 3, 2, 1, 0};
+        assertArrayEquals(expected, sa.getSuffixArray());
     }
 
     @Test
-    @DisplayName("integer alphabet with separators: separators sort first")
-    void integerSymbolsWithSeparators() {
-        // "ab$1ab$2" with $1 = 1, $2 = 2 and a = 10, b = 11
-        int[] text = {10, 11, 1, 10, 11, 2};
-        // suffixes: $1ab$2(2) $2(5) ab$1ab$2(0) ab$2(3) b$1ab$2(1) b$2(4)
-        assertArrayEquals(new int[]{2, 5, 0, 3, 1, 4}, SuffixArray.build(text).getArray());
+    void testRankIsInverseOfSuffixArray() {
+        SuffixArray sa = new SuffixArray("banana$");
+        int[] arr = sa.getSuffixArray();
+        int[] rank = sa.getRank();
+        for (int i = 0; i < arr.length; i++) {
+            assertEquals(i, rank[arr[i]]);
+        }
+    }
+
+    // ---- token (word ID) suffix arrays ----
+
+    @Test
+    void testTokenSuffixArraySortsWordSuffixes() {
+        // Words: the(0) cat(1) sat(2) on(3) the(0) mat(4), then the document sentinel -1.
+        Document doc = new Document(0, "a.txt", "The cat sat on the mat.");
+        TokenCombiner.CombinedTokens combined = TokenCombiner.combine(List.of(doc));
+        assertArrayEquals(new int[]{0, 1, 2, 3, 0, 4, -1}, combined.tokens);
+
+        SuffixArray sa = new SuffixArray(combined.tokens);
+        // Sorted by token IDs: [-1], [0 1 2 3 0 4 -1], [0 4 -1], [1 ...], [2 ...], [3 ...], [4 -1]
+        assertArrayEquals(new int[]{6, 0, 4, 1, 2, 3, 5}, sa.getSuffixArray());
+        assertEquals(combined.length(), sa.length(), "One suffix per WORD (plus sentinel), not per character");
     }
 
     @Test
-    void rejectsNegativeSymbols() {
-        assertThrows(IllegalArgumentException.class, () -> SuffixArray.build(new int[]{1, -1}));
-    }
-
-    @Test
-    @DisplayName("stops doubling as soon as all ranks are unique")
-    void doublingRoundsAreLogarithmic() {
-        assertEquals(0, SuffixArray.fromString("abcd").getDoublingRounds());   // first symbols already unique
-        SuffixArray sa = SuffixArray.fromString("a".repeat(1024));
-        assertTrue(sa.getDoublingRounds() <= 11, "log2(1024) + 1 rounds at most");
-    }
-
-    @Test
-    @DisplayName("matches a brute force sort on 500 random strings")
-    void matchesNaiveSortOnRandomStrings() {
+    void testTokenSuffixArrayMatchesBruteForceOnRandomSequences() {
         Random random = new Random(42);
-        for (int trial = 0; trial < 500; trial++) {
-            int length = 1 + random.nextInt(200);
-            int alphabet = 1 + random.nextInt(4);   // small alphabets create many repeats
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < length; i++) {
-                sb.append((char) ('a' + random.nextInt(alphabet)));
+        for (int trial = 0; trial < 50; trial++) {
+            int n = 1 + random.nextInt(60);
+            int[] tokens = new int[n];
+            for (int i = 0; i < n; i++) {
+                tokens[i] = random.nextInt(4) - (random.nextInt(10) == 0 ? 5 : 0); // includes negative sentinel-like IDs
             }
-            String s = sb.toString();
-            assertArrayEquals(naiveSuffixArray(s), SuffixArray.fromString(s).getArray(), "text: " + s);
+            int[] expected = bruteForce(tokens);
+            assertArrayEquals(expected, new SuffixArray(tokens).getSuffixArray(),
+                    "Mismatch for " + Arrays.toString(tokens));
         }
     }
 
-    /** O(n^2 log n) reference: sort the suffixes as strings. */
-    static int[] naiveSuffixArray(String s) {
-        Integer[] positions = new Integer[s.length()];
-        for (int i = 0; i < s.length(); i++) {
-            positions[i] = i;
-        }
-        Arrays.sort(positions, (a, b) -> s.substring(a).compareTo(s.substring(b)));
-        return Arrays.stream(positions).mapToInt(Integer::intValue).toArray();
+    private static int[] bruteForce(int[] tokens) {
+        Integer[] idx = new Integer[tokens.length];
+        for (int i = 0; i < idx.length; i++) idx[i] = i;
+        Arrays.sort(idx, (a, b) -> {
+            while (a < tokens.length && b < tokens.length) {
+                if (tokens[a] != tokens[b]) return Integer.compare(tokens[a], tokens[b]);
+                a++;
+                b++;
+            }
+            return Integer.compare(tokens.length - a, tokens.length - b); // shorter suffix first
+        });
+        return Arrays.stream(idx).mapToInt(Integer::intValue).toArray();
     }
 }
